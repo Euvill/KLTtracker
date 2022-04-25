@@ -95,6 +95,7 @@
         "unordered_set": "cpp",
         "mutex": "cpp",
         "typeindex": "cpp",
-        "any": "cpp"
+        "any": "cpp",
+        "*.ipp": "cpp"
     }, // 格式化时调整include的顺序（按字母排序）
 }
