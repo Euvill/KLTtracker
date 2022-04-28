@@ -12,11 +12,23 @@
 #define height 480 
 #define fps 30
 
-unsigned int d435_exp  = 0;
+constexpr size_t color_image_size = 3 * width * height;
+
+unsigned int d435_exp = 0;
+
+unsigned int MAX_CNT = 250;
+unsigned int MIN_DIST = 10;
 
 static const std::string window_name = "KLTtracker";
 std::deque<cv::Mat> right_imgs;
 std::deque<cv::Mat> left_imgs;
+
+std::vector<cv::Point2f> features;
+std::vector<cv::Point2f> IniPoints;
+std::vector<cv::Point2f> fpts[2];
+std::vector<uchar> status;
+std::vector<float> errors;
+bool FLOW_BACK = true;
 
 std::mutex mut_;
 std::condition_variable data_cond_;
@@ -26,14 +38,18 @@ rs2::config cfg;
 rs2::pipeline pipe_;
 
 void setImageData(unsigned char * imageArray, cv::Mat image) {
+
     int clos = image.cols;
     int rows = image.rows;
   
     int imageArray_count=0;
-
     for (int i = 0; i < rows; i++) {
-        for (int j = 0; j < clos; j++) {
-            imageArray[imageArray_count] = (unsigned char)image.at<uchar>(i,j);
+        for (int j = 0;j < clos; j++) {
+            imageArray[imageArray_count] = (unsigned char)image.at<cv::Vec3b>(i, j)[0];
+            imageArray_count++;
+            imageArray[imageArray_count] = (unsigned char)image.at<cv::Vec3b>(i, j)[1];
+            imageArray_count++;
+            imageArray[imageArray_count] = (unsigned char)image.at<cv::Vec3b>(i, j)[2];
             imageArray_count++;
         }
     }
@@ -75,6 +91,12 @@ void Setup() {
     pangolin::GetBoundWindow()->RemoveCurrent();
 }
 
+double distance(cv::Point2f &pt1, cv::Point2f &pt2) {
+    double dx = pt1.x - pt2.x;
+    double dy = pt1.y - pt2.y;
+    return sqrt(dx * dx + dy * dy);
+}
+
 void Pangolin_Run() {
     pangolin::BindToContext(window_name);
 
@@ -102,8 +124,10 @@ void Pangolin_Run() {
     pangolin::Var<std::function<void(void)>> laser_off("set.Laser Off", d435_laser_off);
     pangolin::Var<std::function<void(void)>> laser_on("set.Laser ON", d435_laser_on);
 
-    unsigned char* imageArray1 = new unsigned char[width * height];
-    unsigned char* imageArray2 = new unsigned char[width * height];
+    unsigned char* imageArray1 = new unsigned char[color_image_size];
+    unsigned char* imageArray2 = new unsigned char[color_image_size];
+
+    cv::Mat prev_image;
 
     while(true) {
 
@@ -119,16 +143,95 @@ void Pangolin_Run() {
 
         lk.unlock();
 
+        cv::goodFeaturesToTrack(image1_front,
+                                features,
+                                MAX_CNT,  // the maximum number of corner points
+                                0.01,
+                                MIN_DIST);// the minimum distance between two corner points;
+        
+        if(fpts[0].size() < 20) {
+            fpts[0].insert(fpts[0].end(), features.begin(), features.end());
+            IniPoints.insert(IniPoints.end(), features.begin(), features.end());
+        }
+        
+        if(prev_image.empty())
+            image1_front.copyTo(prev_image);
+
+        cv::calcOpticalFlowPyrLK(prev_image,  // the previous image
+                                 image1_front,// the next image
+                                 fpts[0],     // input point, current corner point need to be tracked
+                                 fpts[1],     // output point, the points which have been tracked
+                                 status,      // status == 1, success to be tracked
+                                 errors,   
+                                 cv::Size(21, 21), 
+                                 3);
+        if(FLOW_BACK) {
+            std::vector<uchar> reverse_status;
+            std::vector<cv::Point2f> reverse_pts = fpts[0];
+
+            cv::calcOpticalFlowPyrLK(image1_front, 
+                                     prev_image, 
+                                     fpts[1], 
+                                     reverse_pts, 
+                                     reverse_status, 
+                                     errors, 
+                                     cv::Size(21, 21), 
+                                     1, 
+                                     cv::TermCriteria(cv::TermCriteria::COUNT+cv::TermCriteria::EPS, 30, 0.01), 
+                                     cv::OPTFLOW_USE_INITIAL_FLOW);
+ 
+            for(size_t i = 0; i < status.size(); i++) {
+                if(status[i] && reverse_status[i] && distance(fpts[0][i], reverse_pts[i]) <= 0.1)
+                    status[i] = 1;
+                else
+                    status[i] = 0;
+            }
+        }
+
+        int k = 0;
+        for (int i = 0; i < fpts[1].size(); ++i) {
+            double dist = abs(fpts[0][i].x - fpts[1][i].x) + 
+                          abs(fpts[0][i].y - fpts[1][i].y);
+            if(dist > 2 && status[i]) {
+                IniPoints[k] = IniPoints[i];
+                fpts[1][k++] = fpts[1][i];
+            }
+        }
+
+        cv::Mat image1_front_BGR;
+        cv::cvtColor(image1_front, image1_front_BGR, cv::COLOR_GRAY2BGR);
+        for (size_t t = 0; t < fpts[0].size(); ++t) {
+            cv::line(image1_front_BGR, IniPoints[t], fpts[1][t], cv::Scalar(0, 255, 0));
+        }
+        
+        IniPoints.resize(k);
+        fpts[1].resize(k);
+        std::swap(fpts[1], fpts[0]);
+        
+        for (size_t t = 0; t < fpts[0].size(); ++t) {
+            cv::circle(image1_front_BGR, fpts[0][t], 2, cv::Scalar(0, 0, 255), 2);
+        }
+        for (size_t t = 0; t < features.size(); ++t) {
+            cv::circle(image1_front_BGR, features[t], 2, cv::Scalar(255, 0, 0), 2);
+        }
+
+        image1_front.copyTo(prev_image);
+
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
         d_image1.Activate();
-        setImageData(imageArray1, image1_front);
-        imageTexture1.Upload(imageArray1, GL_LUMINANCE, GL_UNSIGNED_BYTE);
+        setImageData(imageArray1, image1_front_BGR);
+        imageTexture1.Upload(imageArray1, 
+                             GL_BGR,     // GL_LUMINANCE gray image display
+                             GL_UNSIGNED_BYTE);
         imageTexture1.RenderToViewportFlipY();
 
+
         d_image2.Activate();
-        setImageData(imageArray2, image2_front);
-        imageTexture2.Upload(imageArray2, GL_LUMINANCE, GL_UNSIGNED_BYTE);
+        cv::Mat image2_front_BGR;
+        cv::cvtColor(image2_front, image2_front_BGR, cv::COLOR_GRAY2BGR);
+        setImageData(imageArray2, image2_front_BGR);
+        imageTexture2.Upload(imageArray2, GL_BGR, GL_UNSIGNED_BYTE);
         imageTexture2.RenderToViewportFlipY();
 
         d435_exp  = d435_exposure;
